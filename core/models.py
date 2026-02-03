@@ -5,8 +5,8 @@ These models represent the common output format across all BI tool parsers.
 """
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional, Set
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class ObjectType(str, Enum):
@@ -130,8 +130,18 @@ class ParseResult(BaseModel):
     # Statistics
     stats: Dict[str, Any] = Field(default_factory=dict)
     
+    # Deduplication: skip adding object if object_id already seen (same export, package + dataSource or multi-package)
+    _seen_object_ids: Set[str] = PrivateAttr(default_factory=set)
+    
+    def has_object_id(self, obj_id: str) -> bool:
+        """Return True if an object with this object_id was already added."""
+        return obj_id in self._seen_object_ids
+    
     def add_object(self, obj: ExtractedObject) -> None:
-        """Add an extracted object."""
+        """Add an extracted object; skip if object_id already present (first-wins)."""
+        if obj.object_id in self._seen_object_ids:
+            return
+        self._seen_object_ids.add(obj.object_id)
         self.objects.append(obj)
     
     def add_relationship(self, rel: Relationship) -> None:

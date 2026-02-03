@@ -237,7 +237,7 @@ class DashboardExtractor(BaseExtractor):
                             )
                             relationships.append(rel)
                     
-                    # Extract embedded calculations
+                    # Extract embedded calculations (keep as CALCULATED_FIELD; data_usage in properties)
                     calculations = moser_json.get("calculation", [])
                     for calc in calculations:
                         calc_identifier = calc.get("identifier", "unknown")
@@ -245,22 +245,22 @@ class DashboardExtractor(BaseExtractor):
                         calc_name = calc.get("label", calc_identifier)
                         expression = calc.get("expression", "")
                         usage = calc.get("usage", "")
-                        
-                        # Determine object type
-                        obj_type = ObjectType.CALCULATED_FIELD
-                        if usage == "fact":
-                            obj_type = ObjectType.MEASURE
-                        elif usage == "attribute":
-                            obj_type = ObjectType.DIMENSION
+                        # Map usage to data_usage for downstream (measure/dimension/attribute)
+                        data_usage = "unknown"
+                        if usage in ("fact", "measure") or usage == 2:
+                            data_usage = "measure"
+                        elif usage in ("attribute", "dimension") or usage in (0, 1):
+                            data_usage = "dimension" if usage in (1, "dimension") else "attribute"
                         
                         calc_obj = ExtractedObject(
                             object_id=calc_id,
-                            object_type=obj_type,
+                            object_type=ObjectType.CALCULATED_FIELD,
                             name=calc_name,
                             parent_id=dashboard_id,
                             properties={
                                 "expression": expression,
                                 "usage": usage,
+                                "data_usage": data_usage,
                                 "datatype": calc.get("datatype", ""),
                                 "aggregate": calc.get("regularAggregate", ""),
                                 "cognosClass": "embeddedCalculation",

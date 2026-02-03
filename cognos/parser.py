@@ -348,6 +348,9 @@ class CognosParser(BaseParser):
                         # Packages in dataSource.xml are data sources
                         obj_type = ObjectType.DATA_SOURCE
                     elif obj_class in ["smartsModule", "dataModule", "module"]:
+                        # Skip if this module was already extracted from a package file (avoid duplicate module + children)
+                        if result.has_object_id(obj_id):
+                            continue
                         # In dataSource.xml, smartsModule is a sub-module (child of baseModule); dataModule/module are main.
                         # All extracted as DATA_MODULE; is_main_module set in data_module_extractor.
                         # Use the data module extractor
@@ -607,6 +610,11 @@ class CognosParser(BaseParser):
             
             # If we have a specific extractor for this type, use it
             if extractors and object_type in extractors:
+                # Skip data module if already extracted (e.g. from another package file)
+                if object_type == ObjectType.DATA_MODULE:
+                    obj_id = XmlHandler.get_text(obj_elem, "id", default="")
+                    if obj_id and result.has_object_id(obj_id):
+                        return
                 extractor = extractors[object_type]
                 objects, relationships, errors = extractor.extract(obj_elem)
                 

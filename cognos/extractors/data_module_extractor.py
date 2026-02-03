@@ -60,6 +60,31 @@ AGGREGATION_MAP = {
     "maximum": "maximum",
 }
 
+# Patterns that indicate a dataItem expression is an actual calculated field (user-defined expression),
+# not a simple column reference or a simple aggregation. Used to avoid double-extraction and over-counting.
+# Excludes: simple aggregates like SUM([Col]), COUNT([Col]), AVG([Col]) — those are measures, not calculations.
+# Includes: CASE/IF logic, COALESCE/cast, date functions, arithmetic combining columns, min/max/abs in expression.
+CALC_EXPRESSION_PATTERNS = (
+    r'CASE\s+WHEN',
+    r'\bIF\s*\(',
+    r'\babs\s*\(',
+    r'\bminimum\s*\(',
+    r'\bmaximum\s*\(',
+    r'\bcast\s*\(',
+    r'\bcurrent_date',
+    r'\bcurrent_timestamp',
+    r'\bCOALESCE\s*\(',
+    r'[\+\-\*\/]',  # Arithmetic operators (combining columns)
+)
+_CALC_EXPRESSION_REGEX = re.compile('|'.join(CALC_EXPRESSION_PATTERNS), re.IGNORECASE)
+
+
+def _expression_is_calculated_field(expression: Optional[str]) -> bool:
+    """Return True if the expression indicates a calculated field (not a simple column reference)."""
+    if not expression or not isinstance(expression, str):
+        return False
+    return bool(_CALC_EXPRESSION_REGEX.search(expression.strip()))
+
 
 class DataModuleExtractor(BaseExtractor):
     """Extractor for Cognos Data Module objects (smartsModule, module, model).
@@ -558,12 +583,14 @@ class DataModuleExtractor(BaseExtractor):
                     datatype = qi.get("datatype", "")
                     aggregate = qi.get("regularAggregate", "")
                     
-                    # Map usage to data_usage
-                    data_usage = "unknown"
-                    if usage == "fact" or usage == "measure":
-                        data_usage = "measure"
-                    elif usage == "attribute" or usage == "dimension":
-                        data_usage = "dimension"
+                    # Map usage to data_usage (support both string and numeric Cognos codes: 0=attr, 1=dim, 2=measure)
+                    usage_str = str(usage).strip() if usage is not None else ""
+                    data_usage = DATA_USAGE_MAP.get(usage_str, "unknown")
+                    if data_usage == "unknown" and usage_str:
+                        if usage in ("fact", "measure") or usage == 2:
+                            data_usage = "measure"
+                        elif usage in ("attribute", "dimension") or usage in (0, 1):
+                            data_usage = "dimension" if usage in (1, "dimension") else "attribute"
                     
                     # Map datatype
                     data_type = "unknown"
@@ -574,10 +601,10 @@ class DataModuleExtractor(BaseExtractor):
                         else:
                             data_type = datatype
                     
-                    # Map aggregate
+                    # Map aggregate (support non-string from JSON)
                     agg_type = "none"
-                    if aggregate:
-                        agg_type = AGGREGATION_MAP.get(aggregate.lower(), aggregate)
+                    if aggregate is not None and aggregate != "":
+                        agg_type = AGGREGATION_MAP.get(str(aggregate).lower(), str(aggregate))
                     
                     # Create column object with full metadata
                     column_obj = self._create_object(
@@ -599,10 +626,10 @@ class DataModuleExtractor(BaseExtractor):
                         }
                     )
                     
-                    # Determine object type
+                    # Determine object type (treat attribute as dimension for analytics)
                     if data_usage == "measure" or agg_type != "none":
                         column_obj.object_type = ObjectType.MEASURE
-                    elif data_usage == "dimension":
+                    elif data_usage in ("dimension", "attribute"):
                         column_obj.object_type = ObjectType.DIMENSION
                     else:
                         column_obj.object_type = ObjectType.COLUMN
@@ -698,6 +725,7 @@ class DataModuleExtractor(BaseExtractor):
                             relationships.append(rel)
             
             # Extract calculations (embedded calculated fields) (dedupe by calc_id)
+            # Always keep object_type as CALCULATED_FIELD; store data_usage in properties for measure/dimension use.
             calculations = moser_json.get("calculation", [])
             if not isinstance(calculations, list):
                 calculations = [calculations] if calculations else []
@@ -713,12 +741,8 @@ class DataModuleExtractor(BaseExtractor):
                 datatype = calc.get("datatype", "")
                 aggregate = calc.get("regularAggregate", "")
                 
-                # Determine object type based on usage
+                # Keep as CALCULATED_FIELD; data_usage in properties indicates use as measure/dimension
                 obj_type = ObjectType.CALCULATED_FIELD
-                if usage == "fact" or usage == "measure":
-                    obj_type = ObjectType.MEASURE
-                elif usage == "attribute" or usage == "dimension":
-                    obj_type = ObjectType.DIMENSION
                 
                 # Map datatype to data_type for consistency
                 data_type = "unknown"
@@ -728,19 +752,19 @@ class DataModuleExtractor(BaseExtractor):
                     else:
                         data_type = datatype
                 
-                # Map usage to data_usage for consistency
-                data_usage = "unknown"
-                if usage == "fact" or usage == "measure":
-                    data_usage = "measure"
-                elif usage == "attribute" or usage == "dimension":
-                    data_usage = "dimension"
-                elif usage:
-                    data_usage = usage
+                # Map usage to data_usage (support string and numeric: 0=attr, 1=dim, 2=measure)
+                usage_str = str(usage).strip() if usage is not None else ""
+                data_usage = DATA_USAGE_MAP.get(usage_str, "unknown")
+                if data_usage == "unknown" and usage_str:
+                    if usage in ("fact", "measure") or usage == 2:
+                        data_usage = "measure"
+                    elif usage in ("attribute", "dimension") or usage in (0, 1):
+                        data_usage = "dimension" if usage in (1, "dimension") else "attribute"
                 
-                # Map aggregate
+                # Map aggregate (support non-string from JSON)
                 agg_type = "none"
-                if aggregate:
-                    agg_type = AGGREGATION_MAP.get(aggregate.lower(), aggregate)
+                if aggregate is not None and aggregate != "":
+                    agg_type = AGGREGATION_MAP.get(str(aggregate).lower(), str(aggregate) if aggregate else "none")
                 
                 calc_obj = self._create_object(
                     object_id=calc_id,
@@ -787,8 +811,8 @@ class DataModuleExtractor(BaseExtractor):
                         )
                         relationships.append(dep_rel)
                 
-                # Also create aggregates relationship if this is a measure
-                if obj_type == ObjectType.MEASURE and aggregate:
+                # Also create aggregates relationship if this calculated field is used as a measure
+                if data_usage == "measure" and aggregate:
                     # Try to find base columns from expression
                     if expression:
                         col_refs = re.findall(r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]', expression)
@@ -936,6 +960,11 @@ class DataModuleExtractor(BaseExtractor):
             if expr_elem is not None and expr_elem.text:
                 expression = expr_elem.text.strip()
             
+            # Skip dataItems that are calculated fields; they are emitted only by _extract_calculated_fields
+            # to avoid double-extraction (same dataItem as both measure/dimension and calculated_field).
+            if _expression_is_calculated_field(expression):
+                continue
+            
             # Parse RS_dataType and RS_dataUsage from XMLAttributes
             data_type = None
             data_usage = None
@@ -961,10 +990,11 @@ class DataModuleExtractor(BaseExtractor):
                     source_column = match.group(3)
             
             # Determine object type based on usage
+            # RS_dataUsage: 0=attribute, 1=dimension, 2=measure. Treat attribute as dimension for analytics.
             obj_type = ObjectType.COLUMN
             if data_usage == 'measure' or aggregate != 'none':
                 obj_type = ObjectType.MEASURE
-            elif data_usage == 'dimension':
+            elif data_usage in ('dimension', 'attribute'):
                 obj_type = ObjectType.DIMENSION
             
             # Create column object
@@ -1018,33 +1048,15 @@ class DataModuleExtractor(BaseExtractor):
         parent_id: str
     ) -> Tuple[List[ExtractedObject], List[Relationship]]:
         """
-        Extract calculated fields (dataItems with complex expressions).
+        Extract calculated fields (dataItems with actual calculation expressions).
         
-        Identifies calculated fields by:
-        - Expressions containing functions (CASE, IF, abs, minimum, etc.)
-        - Expressions not following simple [DS].[Table].[Col] pattern
+        Identifies calculated fields by expression patterns only; excludes simple
+        aggregates (SUM/COUNT/AVG on a single column) so those stay as measures.
+        Includes: CASE WHEN, IF(, COALESCE(, cast(, arithmetic, current_date, etc.
         """
         calc_fields = []
         relationships = []
         seen_fields: Set[str] = set()
-        
-        # Functions that indicate a calculated field
-        calc_patterns = [
-            r'CASE\s+WHEN',
-            r'\bIF\s*\(',
-            r'\babs\s*\(',
-            r'\bminimum\s*\(',
-            r'\bmaximum\s*\(',
-            r'\bcast\s*\(',
-            r'\bCOUNT\s*\(',
-            r'\bSUM\s*\(',
-            r'\bAVG\s*\(',
-            r'\bcurrent_date',
-            r'\bcurrent_timestamp',
-            r'\bCOALESCE\s*\(',
-            r'[\+\-\*\/]',  # Arithmetic operators
-        ]
-        calc_regex = '|'.join(calc_patterns)
         
         for data_item in root.iter():
             if not data_item.tag.endswith('dataItem'):
@@ -1061,8 +1073,8 @@ class DataModuleExtractor(BaseExtractor):
                 
             expression = expr_elem.text.strip()
             
-            # Check if it's a calculated field
-            if not re.search(calc_regex, expression, re.IGNORECASE):
+            # Only emit calculated fields (same rule as _extract_data_items skip to avoid duplication)
+            if not _expression_is_calculated_field(expression):
                 continue
             
             seen_fields.add(name)
