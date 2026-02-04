@@ -1,9 +1,10 @@
 """
 Report extractor for Cognos.
 """
-from typing import List, Any, Dict, Optional, Set
-from datetime import datetime
+import html
 import logging
+from datetime import datetime
+from typing import List, Any, Dict, Optional, Set
 
 from ...core import BaseExtractor, ExtractedObject, Relationship, ParseError, ObjectType, RelationshipType
 from ...core.handlers import XmlHandler
@@ -126,23 +127,27 @@ class ReportExtractor(BaseExtractor):
                     if val:
                         properties[prop_name] = val.lower() == "true"
 
-                # Extract specification for deeper analysis
+                # Extract specification for deeper analysis (prompts, queries, etc.)
                 spec_elem = props_elem.find("specification/value")
-                if spec_elem is not None and spec_elem.text:
-                    specification_xml = spec_elem.text
-                    # Check if it's base64 encoded
-                    import base64
-                    try:
-                        # Try to decode if it looks like base64
-                        if len(specification_xml) > 100 and not specification_xml.strip().startswith('<'):
-                            try:
-                                decoded = base64.b64decode(specification_xml).decode('utf-8')
-                                if decoded.strip().startswith('<'):
-                                    specification_xml = decoded
-                            except:
-                                pass  # Not base64, use as-is
-                    except:
-                        pass
+                if spec_elem is not None:
+                    # Collect full text: use itertext() so we get all text (incl. from nested nodes)
+                    specification_xml = "".join(spec_elem.itertext()).strip() if hasattr(spec_elem, "itertext") else (spec_elem.text or "")
+                    if specification_xml:
+                        # Package XML may store spec as HTML-escaped (&lt; &gt;) — unescape so we can parse as XML
+                        if specification_xml.strip().startswith("&lt;"):
+                            specification_xml = html.unescape(specification_xml)
+                        # Check if it's base64 encoded (e.g. some exports)
+                        import base64
+                        try:
+                            if len(specification_xml) > 100 and not specification_xml.strip().startswith("<"):
+                                try:
+                                    decoded = base64.b64decode(specification_xml).decode("utf-8")
+                                    if decoded.strip().startswith("<"):
+                                        specification_xml = decoded
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
             
             # Create report object
             report = self._create_object(
@@ -178,8 +183,8 @@ class ReportExtractor(BaseExtractor):
                         )
                         relationships.append(rel)
             
-            # Deep extraction from specification
-            if specification_xml:
+            # Deep extraction from specification (only when it looks like XML; explorations may have JSON spec)
+            if specification_xml and specification_xml.strip().startswith("<"):
                 spec_objects, spec_rels, spec_errors = self._extract_specification(
                     specification_xml,
                     report_id=obj_id,
@@ -347,7 +352,8 @@ class ReportExtractor(BaseExtractor):
                         if sql_text_elem is not None:
                             sql_content = sql_text_elem.text
 
-                # Create Query Object
+                # Create Query Object (do not also create a separate Prompt for query names containing "prompt" — avoid duplication)
+                is_prompt_query = "prompt" in (query_name or "").lower()
                 query_obj = self._create_object(
                     object_id=query_id,
                     name=query_name,
@@ -355,7 +361,8 @@ class ReportExtractor(BaseExtractor):
                     properties={
                         "source_type": source_type,
                         "sql_content": sql_content,
-                        "cognosClass": "query"
+                        "cognosClass": "query",
+                        "is_prompt_query": is_prompt_query,
                     }
                 )
                 query_obj.object_type = ObjectType.QUERY
@@ -1000,94 +1007,85 @@ class ReportExtractor(BaseExtractor):
         report_id: str
     ) -> tuple[List[ExtractedObject], List[Relationship]]:
         """
-        Extract prompt pages and prompt queries from report.
+        Extract actual prompts from report specification.
         
-        Finds prompts in:
-        - promptPages elements
-        - Queries named "Prompt Query" or containing prompt definitions
+        Finds:
+        1. Prompt pages: promptPages and reportPages with "prompt" in page name.
+        2. Prompt controls: elements with parameter= (textBox, selectDate, selectTime,
+           selectDateTime, selectWithTree, generatedPrompt, etc.) — the real user prompts.
         """
         objects = []
         relationships = []
         seen_prompt_ids: Set[str] = set()
 
-        def add_prompt_page(page_id: str, page_name: str) -> None:
-            if page_id in seen_prompt_ids:
+        def add_prompt(
+            prompt_id: str,
+            name: str,
+            prompt_type: str,
+            extra_props: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            if prompt_id in seen_prompt_ids:
                 return
-            seen_prompt_ids.add(page_id)
+            seen_prompt_ids.add(prompt_id)
+            props: Dict[str, Any] = {"prompt_type": prompt_type, "cognosClass": "prompt"}
+            if extra_props:
+                props.update(extra_props)
             prompt_obj = self._create_object(
-                object_id=page_id,
-                name=page_name,
+                object_id=prompt_id,
+                name=name,
                 parent_id=report_id,
-                properties={
-                    "prompt_type": "page",
-                    "cognosClass": "prompt"
-                }
+                properties=props,
             )
             prompt_obj.object_type = ObjectType.PROMPT
             objects.append(prompt_obj)
             relationships.append(
                 self._create_relationship(
                     source_id=report_id,
-                    target_id=page_id,
+                    target_id=prompt_id,
                     relationship_type=RelationshipType.CONTAINS,
-                    properties={"containment_type": "report_prompt"}
+                    properties={"containment_type": "report_prompt"},
                 )
             )
 
-        # Extract prompt pages from promptPages container
-        prompt_pages = root.findall(".//{*}promptPages")
-        for prompt_page_container in prompt_pages:
-            pages = prompt_page_container.findall(".//{*}page")
-            for page_elem in pages:
+        # 1. Prompt pages from promptPages
+        for prompt_page_container in root.findall(".//{*}promptPages"):
+            for page_elem in prompt_page_container.findall(".//{*}page"):
                 page_name = page_elem.get("name") or "Prompt Page"
-                page_id = f"{report_id}:prompt:{page_name}"
-                add_prompt_page(page_id, page_name)
-        # Also extract pages under reportPages whose name contains "Prompt"
-        # (Cognos stores prompt pages as reportPages with names like "Text Prompt Page")
+                page_id = f"{report_id}:prompt:page:{page_name}"
+                add_prompt(page_id, page_name, "page")
+        # Also reportPages whose name contains "Prompt" (e.g. "Text Prompt Page")
         for report_pages in root.findall(".//{*}reportPages"):
             for page_elem in report_pages.findall(".//{*}page"):
                 page_name = page_elem.get("name") or ""
                 if "prompt" in page_name.lower():
-                    page_id = f"{report_id}:prompt:{page_name}"
-                    add_prompt_page(page_id, page_name)
-        
-        # Extract prompt queries (queries that are used for prompts)
-        for query_elem in root.findall(".//{*}query"):
-            query_name = query_elem.get("name", "")
-            if "prompt" in query_name.lower() or "Prompt" in query_name:
-                query_id = f"{report_id}:query:{query_name}"
-                
-                # Check if this query is used for prompts
-                prompt_obj = self._create_object(
-                    object_id=f"{report_id}:prompt:query:{query_name}",
-                    name=f"Prompt: {query_name}",
-                    parent_id=report_id,
-                    properties={
-                        "prompt_type": "query",
-                        "query_name": query_name,
-                        "cognosClass": "prompt"
-                    }
-                )
-                prompt_obj.object_type = ObjectType.PROMPT
-                objects.append(prompt_obj)
-                
-                rel = self._create_relationship(
-                    source_id=report_id,
-                    target_id=prompt_obj.object_id,
-                    relationship_type=RelationshipType.CONTAINS,
-                    properties={"containment_type": "report_prompt"}
-                )
-                relationships.append(rel)
-                
-                # Link to query
-                rel_query = self._create_relationship(
-                    source_id=prompt_obj.object_id,
-                    target_id=query_id,
-                    relationship_type=RelationshipType.USES,
-                    properties={"dependency_type": "prompt_query"}
-                )
-                relationships.append(rel_query)
-        
+                    page_id = f"{report_id}:prompt:page:{page_name}"
+                    add_prompt(page_id, page_name, "page")
+
+        # 2. Actual prompt controls (parameter=...) — textBox, selectDate, selectTime, etc.
+        prompt_control_tags = (
+            "textBox", "selectDate", "selectTime", "selectDateTime",
+            "selectWithTree", "selectWithSearch", "selectWithDropdown",
+            "generatedPrompt", "valuePrompt", "filter",
+        )
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag not in prompt_control_tags:
+                continue
+            param_name = elem.get("parameter")
+            if not param_name or not param_name.strip():
+                continue
+            param_name = param_name.strip()
+            control_id = f"{report_id}:prompt:param:{param_name}"
+            if control_id in seen_prompt_ids:
+                continue
+            ref_query = elem.get("refQuery") or ""
+            add_prompt(
+                control_id,
+                param_name,
+                "parameter",
+                {"control_type": tag, "refQuery": ref_query} if ref_query else {"control_type": tag},
+            )
+
         return objects, relationships
 
     def _extract_sorts(

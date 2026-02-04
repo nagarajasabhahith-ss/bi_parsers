@@ -8,6 +8,7 @@ from typing import List, Any, Dict, Optional, Tuple
 from datetime import datetime
 import json
 import logging
+import re
 
 from ...core import BaseExtractor, ExtractedObject, Relationship, ParseError, ObjectType, RelationshipType
 from ...core.handlers import XmlHandler
@@ -15,6 +16,16 @@ from ..visualization_types import map_dashboard_visid_to_type
 
 
 logger = logging.getLogger(__name__)
+
+# Pattern: expression is only a single [connection].[table].[column] reference (no actual calculation)
+_SIMPLE_COLUMN_REF = re.compile(r"^\s*\[[^\]]+\]\.\[[^\]]+\]\.\[[^\]]+\]\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _expression_is_simple_column_reference(expression: Optional[str]) -> bool:
+    """True if expression is only a single [M].[T].[C] reference (e.g. [bq-connection].[Orders].[Region])."""
+    if not expression or not isinstance(expression, str):
+        return False
+    return bool(_SIMPLE_COLUMN_REF.match(expression.strip()))
 
 
 class DashboardExtractor(BaseExtractor):
@@ -106,10 +117,13 @@ class DashboardExtractor(BaseExtractor):
                 if hidden:
                     properties["hidden"] = hidden.lower() == "true"
                 
-                # Extract specification JSON for visualization parsing
+                # Extract specification JSON for visualization parsing (full content in case of split text nodes)
                 spec_elem = props_elem.find("specification/value")
-                if spec_elem is not None and spec_elem.text:
-                    specification_json = spec_elem.text
+                if spec_elem is not None:
+                    specification_json = spec_elem.text or ""
+                    if not specification_json and hasattr(spec_elem, "itertext"):
+                        specification_json = "".join(spec_elem.itertext()).strip()
+                    specification_json = specification_json.strip() or None
             
             # Create dashboard object
             dashboard = self._create_object(
@@ -133,7 +147,7 @@ class DashboardExtractor(BaseExtractor):
                 )
                 relationships.append(rel)
             
-            # Extract visualizations and tabs from specification JSON
+            # Extract visualizations, tabs, and dashboard filters from specification JSON
             if specification_json:
                 # Extract tabs first (they contain visualizations)
                 tab_objects, tab_rels, tab_errors = self._extract_tabs(
@@ -154,6 +168,36 @@ class DashboardExtractor(BaseExtractor):
                 objects.extend(viz_objects)
                 relationships.extend(viz_rels)
                 errors.extend(viz_errors)
+                
+                # Extract dashboard-level filters from pageContext (Dashboard L2 etc.)
+                filter_objects, filter_rels, filter_errors = self._extract_dashboard_filters(
+                    specification_json,
+                    dashboard_id=obj_id,
+                    dashboard_name=name
+                )
+                objects.extend(filter_objects)
+                relationships.extend(filter_rels)
+                errors.extend(filter_errors)
+                
+                # Store human names for data sources (assetId -> name) so report can show "Orders (BQ)..." instead of model id
+                try:
+                    spec = json.loads(specification_json)
+                    sources = spec.get("dataSources", {}).get("sources", [])
+                    data_module_display_names = {}
+                    for ds in sources:
+                        if ds.get("type") != "module":
+                            continue
+                        key = ds.get("assetId") or ds.get("id")
+                        if key:
+                            data_module_display_names[str(key).strip()] = (ds.get("name") or ds.get("label") or "").strip()
+                    if data_module_display_names:
+                        for o in objects:
+                            if getattr(o, "object_id", None) == obj_id:
+                                o.properties = dict(o.properties) if o.properties else {}
+                                o.properties["data_module_display_names"] = data_module_display_names
+                                break
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
             
         except Exception as e:
             error = self._create_error(
@@ -219,8 +263,9 @@ class DashboardExtractor(BaseExtractor):
                 shaping = ds.get("shaping", {})
                 moser_json = shaping.get("moserJSON", {})
                 
+                # USES to data module: from useSpec (moserJSON) or from assetId when type is module
+                ref_store_id = None
                 if moser_json:
-                    # Extract USES relationship to base module via useSpec
                     use_specs = moser_json.get("useSpec", [])
                     for use_spec in use_specs:
                         ref_store_id = use_spec.get("storeID")
@@ -236,14 +281,34 @@ class DashboardExtractor(BaseExtractor):
                                 }
                             )
                             relationships.append(rel)
+                            break
+                # Fallback: link dashboard to module by assetId when type is "module" (covers missing/empty useSpec)
+                if ref_store_id is None and ds.get("type") == "module":
+                    asset_id = ds.get("assetId")
+                    if asset_id:
+                        rel = Relationship(
+                            source_id=dashboard_id,
+                            target_id=asset_id,
+                            relationship_type=RelationshipType.USES,
+                            properties={
+                                "dependency_type": "data_source",
+                                "ref_type": "module",
+                                "identifier": "",
+                            }
+                        )
+                        relationships.append(rel)
+                if moser_json:
                     
-                    # Extract embedded calculations (keep as CALCULATED_FIELD; data_usage in properties)
+                    # Extract embedded calculations (keep as CALCULATED_FIELD; data_usage in properties).
+                    # Skip expressions that are only a simple column reference [M].[T].[C] (e.g. [bq-connection].[Orders].[Region]).
                     calculations = moser_json.get("calculation", [])
                     for calc in calculations:
                         calc_identifier = calc.get("identifier", "unknown")
                         calc_id = f"{dashboard_id}:emb_calc:{calc_identifier}"
                         calc_name = calc.get("label", calc_identifier)
                         expression = calc.get("expression", "")
+                        if _expression_is_simple_column_reference(expression):
+                            continue
                         usage = calc.get("usage", "")
                         # Map usage to data_usage for downstream (measure/dimension/attribute)
                         data_usage = "unknown"
@@ -366,6 +431,15 @@ class DashboardExtractor(BaseExtractor):
                 if viz_obj:
                     objects.append(viz_obj)
                     relationships.extend(viz_rels)
+                    # Extract sort configuration from widget JSON (sortBy, defaultSort, sort, dataViews[].sort, etc.)
+                    sort_objs, sort_rels = self._extract_widget_sorts(
+                        widget_id=widget_id,
+                        widget_data=widget_data,
+                        dashboard_id=dashboard_id,
+                        viz_obj_id=viz_obj.object_id,
+                    )
+                    objects.extend(sort_objs)
+                    relationships.extend(sort_rels)
                     
             except Exception as e:
                 logger.debug(f"Error processing widget {widget_id}: {e}")
@@ -525,7 +599,205 @@ class DashboardExtractor(BaseExtractor):
                     relationships.append(rel_uses)
         
         return viz_obj, relationships
-    
+
+    def _extract_widget_sorts(
+        self,
+        widget_id: str,
+        widget_data: Dict[str, Any],
+        dashboard_id: str,
+        viz_obj_id: str,
+    ) -> tuple[List[ExtractedObject], List[Relationship]]:
+        """
+        Extract sort configuration from dashboard widget JSON.
+
+        Looks for sort config in common locations:
+        - widget_data: sort, sortBy, defaultSort
+        - widget_data.data: sort, sortBy, defaultSort, sortItems
+        - widget_data.data.dataViews[].sort, sortBy, defaultSort, sortItems
+
+        Each sort item can be an object with dataItemId/itemId/refDataItem and
+        direction/sortOrder/order, or a string (column ref). Creates Sort objects
+        with CONTAINS from the visualization so they are attributed to the dashboard.
+        """
+        sort_objects: List[ExtractedObject] = []
+        sort_relationships: List[Relationship] = []
+        raw_items: List[Dict[str, Any]] = []
+
+        def _column_ref(item: Any) -> Optional[str]:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, dict):
+                return (
+                    item.get("dataItemId") or item.get("itemId") or item.get("refDataItem")
+                    or item.get("dataItem") or item.get("column")
+                )
+            return None
+
+        def _direction(item: Any) -> str:
+            if isinstance(item, dict):
+                d = (
+                    item.get("direction") or item.get("sortOrder") or item.get("order")
+                    or ""
+                )
+                if isinstance(d, str):
+                    d = d.strip().lower()
+                    if d in ("asc", "ascending"):
+                        return "ascending"
+                    if d in ("desc", "descending"):
+                        return "descending"
+            return "ascending"
+
+        def _collect(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, list):
+                for v in value:
+                    _collect(v)
+                return
+            if isinstance(value, dict):
+                col = _column_ref(value)
+                if col:
+                    raw_items.append({"column": col, "direction": _direction(value)})
+                return
+            if isinstance(value, str) and value.strip():
+                raw_items.append({"column": value.strip(), "direction": "ascending"})
+
+        # Widget-level sort keys
+        for key in ("sort", "sortBy", "defaultSort", "sortItems"):
+            _collect(widget_data.get(key))
+
+        # data.sort, data.sortBy, data.defaultSort, data.sortItems
+        data = widget_data.get("data") or {}
+        if isinstance(data, dict):
+            for key in ("sort", "sortBy", "defaultSort", "sortItems"):
+                _collect(data.get(key))
+
+        # Per dataView: sort, sortBy, defaultSort, sortItems
+        data_views = data.get("dataViews", []) if isinstance(data, dict) else []
+        for dv in data_views if isinstance(data_views, list) else []:
+            if not isinstance(dv, dict):
+                continue
+            for key in ("sort", "sortBy", "defaultSort", "sortItems"):
+                _collect(dv.get(key))
+
+        seen_keys: set = set()
+        sort_idx = 0
+        for item in raw_items:
+            col = item.get("column") or ""
+            direction = item.get("direction") or "ascending"
+            key = (col.lower(), direction)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            sort_id = f"{viz_obj_id}:sort:{sort_idx}"
+            sort_idx += 1
+            sort_name = f"Sort: {col} ({direction})"
+            sort_obj = ExtractedObject(
+                object_id=sort_id,
+                object_type=ObjectType.SORT,
+                name=sort_name,
+                parent_id=viz_obj_id,
+                properties={
+                    "direction": direction,
+                    "sorted_column": col,
+                    "refDataItem": col,
+                    "sort_items": [{"column": col, "direction": direction}],
+                    "cognosClass": "sort",
+                    "source": "dashboard_widget",
+                },
+                bi_tool=self.bi_tool,
+            )
+            sort_objects.append(sort_obj)
+            sort_relationships.append(
+                Relationship(
+                    source_id=viz_obj_id,
+                    target_id=sort_id,
+                    relationship_type=RelationshipType.CONTAINS,
+                    properties={"containment_type": "widget_sort"},
+                )
+            )
+
+        return sort_objects, sort_relationships
+
+    def _extract_dashboard_filters(
+        self,
+        json_content: str,
+        dashboard_id: str,
+        dashboard_name: str
+    ) -> tuple[List[ExtractedObject], List[Relationship], List[ParseError]]:
+        """
+        Extract dashboard-level filters from specification JSON pageContext.
+
+        Dashboard L2 and similar explorations store filters in pageContext (array of
+        objects with origin "filter", scope, hierarchyNames, conditions, tupleSet).
+        These are page/tab-level filters, not report XML detailFilter/summaryFilter.
+        """
+        objects: List[ExtractedObject] = []
+        relationships: List[Relationship] = []
+        errors: List[ParseError] = []
+        try:
+            spec = json.loads(json_content)
+        except json.JSONDecodeError as e:
+            errors.append(self._create_error(
+                level="warning",
+                message=f"Failed to parse dashboard JSON for filters: {str(e)}"
+            ))
+            return objects, relationships, errors
+
+        page_context = spec.get("pageContext")
+        if not isinstance(page_context, list):
+            return objects, relationships, errors
+
+        filter_idx = 0
+        for ctx in page_context:
+            if not isinstance(ctx, dict):
+                continue
+            if ctx.get("origin") != "filter":
+                continue
+            filter_idx += 1
+            filter_id = f"{dashboard_id}:pageContext_filter:{filter_idx}"
+            hierarchy_names = ctx.get("hierarchyNames") or []
+            scope = ctx.get("scope") or ""
+            name_parts = list(hierarchy_names)[:3] if hierarchy_names else [f"Filter_{filter_idx}"]
+            filter_name = ", ".join(str(n) for n in name_parts) if name_parts else f"Filter_{filter_idx}"
+
+            # Build properties (truncate large tupleSet for storage)
+            props: Dict[str, Any] = {
+                "filter_scope": "dashboard_pageContext",
+                "scope": scope,
+                "hierarchyNames": hierarchy_names,
+                "hierarchyUniqueNames": ctx.get("hierarchyUniqueNames") or [],
+                "sourceId": ctx.get("sourceId"),
+                "exclude": ctx.get("exclude", False),
+                "isNamedSet": ctx.get("isNamedSet", False),
+                "parent_id": dashboard_id,
+                "cognosClass": "filter",
+            }
+            conditions = ctx.get("conditions")
+            if conditions is not None:
+                props["conditions"] = conditions
+            tuple_set = ctx.get("tupleSet")
+            if tuple_set is not None:
+                s = tuple_set if isinstance(tuple_set, str) else str(tuple_set)
+                props["tupleSet"] = s if len(s) <= 2000 else s[:2000] + "…"
+
+            filter_obj = self._create_object(
+                object_id=filter_id,
+                name=filter_name,
+                parent_id=dashboard_id,
+                properties=props,
+            )
+            filter_obj.object_type = ObjectType.FILTER
+            objects.append(filter_obj)
+            rel = self._create_relationship(
+                source_id=dashboard_id,
+                target_id=filter_id,
+                relationship_type=RelationshipType.FILTERS_BY
+            )
+            relationships.append(rel)
+
+        return objects, relationships, errors
+
     def _extract_tabs(
         self,
         json_content: str,

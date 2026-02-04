@@ -63,7 +63,9 @@ AGGREGATION_MAP = {
 # Patterns that indicate a dataItem expression is an actual calculated field (user-defined expression),
 # not a simple column reference or a simple aggregation. Used to avoid double-extraction and over-counting.
 # Excludes: simple aggregates like SUM([Col]), COUNT([Col]), AVG([Col]) — those are measures, not calculations.
-# Includes: CASE/IF logic, COALESCE/cast, date functions, arithmetic combining columns, min/max/abs in expression.
+# Includes: CASE/IF logic, COALESCE/cast, date functions, extract, substring_regex, _days_to_end_of_month,
+# _first_of_month, arithmetic combining columns, min/max/abs in expression.
+# Plus a generic pattern: any identifier( that is not a common aggregate (catches unknown Cognos functions).
 CALC_EXPRESSION_PATTERNS = (
     r'CASE\s+WHEN',
     r'\bIF\s*\(',
@@ -74,9 +76,31 @@ CALC_EXPRESSION_PATTERNS = (
     r'\bcurrent_date',
     r'\bcurrent_timestamp',
     r'\bCOALESCE\s*\(',
+    r'\bextract\s*\(',  # extract( — date/time part
+    r'substring_regex',  # substring_regex
+    r'_days_to_end_of_month',
+    r'_first_of_month',
+    r'_last_of_month',
+    r'_first_of_quarter',
+    r'_last_of_quarter',
+    r'_first_of_year',
+    r'_last_of_year',
+    r'position_regex',
+    r'substring\s*\(',
     r'[\+\-\*\/]',  # Arithmetic operators (combining columns)
+    r'\baverage\s*\(',  # average( — treat as calculated field (not simple measure)
+    # Generic: any function call that is NOT a common aggregate (catches unknown Cognos functions)
+    r'(?!\b(sum|count|avg|min|max|total|average)\b)\b[a-z_][a-z0-9_]*\s*\(',
 )
 _CALC_EXPRESSION_REGEX = re.compile('|'.join(CALC_EXPRESSION_PATTERNS), re.IGNORECASE)
+
+# Cognos often uses leading underscore for calculated/system items (e.g. _days_to_end_of_month, _first_of_month)
+def _name_looks_like_calculated_field(name: Optional[str]) -> bool:
+    """True if name suggests a calculated field (e.g. Cognos convention: leading underscore)."""
+    if not name or not isinstance(name, str):
+        return False
+    n = name.strip()
+    return len(n) > 1 and n.startswith('_')
 
 
 def _expression_is_calculated_field(expression: Optional[str]) -> bool:
@@ -84,6 +108,33 @@ def _expression_is_calculated_field(expression: Optional[str]) -> bool:
     if not expression or not isinstance(expression, str):
         return False
     return bool(_CALC_EXPRESSION_REGEX.search(expression.strip()))
+
+
+# Pattern: expression is only a single [connection].[table].[column] reference (no actual calculation)
+_SIMPLE_COLUMN_REF = re.compile(r"^\s*\[[^\]]+\]\.\[[^\]]+\]\.\[[^\]]+\]\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _expression_is_simple_column_reference(expression: Optional[str]) -> bool:
+    """True if expression is only a single [M].[T].[C] reference (e.g. [bq-connection].[Orders].[Quantity])."""
+    if not expression or not isinstance(expression, str):
+        return False
+    return bool(_SIMPLE_COLUMN_REF.match(expression.strip()))
+
+
+# Well-known dimension/categorical column names (report spec may omit RS_dataUsage; treat as dimension when no aggregation)
+_DIMENSION_LIKE_NAMES = frozenset({
+    "postal_code", "segment", "category", "sub_category", "region", "country", "state", "city",
+    "customer_name", "customer_id", "product_name", "product_id", "order_id", "order_date",
+    "ship_date", "ship_mode", "state_", "region_",
+})
+
+
+def _name_looks_like_dimension(name: Optional[str]) -> bool:
+    """True if column name is typically a dimension (e.g. Postal_Code, Segment, Category)."""
+    if not name or not isinstance(name, str):
+        return False
+    n = name.strip().lower().replace(" ", "_").replace("-", "_")
+    return n in _DIMENSION_LIKE_NAMES
 
 
 class DataModuleExtractor(BaseExtractor):
@@ -606,6 +657,10 @@ class DataModuleExtractor(BaseExtractor):
                     if aggregate is not None and aggregate != "":
                         agg_type = AGGREGATION_MAP.get(str(aggregate).lower(), str(aggregate))
                     
+                    # When usage is unknown and no aggregation, infer dimension for simple [M].[T].[C] columns
+                    if data_usage == "unknown" and agg_type == "none" and _expression_is_simple_column_reference(expression):
+                        data_usage = "dimension"
+                    
                     # Create column object with full metadata
                     column_obj = self._create_object(
                         object_id=column_id,
@@ -627,8 +682,12 @@ class DataModuleExtractor(BaseExtractor):
                     )
                     
                     # Determine object type (treat attribute as dimension for analytics)
+                    # Expression-based calculations (extract, substring_regex, _days_to_end_of_month, etc.) → calculated field
                     if data_usage == "measure" or agg_type != "none":
                         column_obj.object_type = ObjectType.MEASURE
+                    elif data_usage in ("dimension", "attribute") and _expression_is_calculated_field(expression):
+                        column_obj.object_type = ObjectType.CALCULATED_FIELD
+                        column_obj.properties["calculation_type"] = "expression"
                     elif data_usage in ("dimension", "attribute"):
                         column_obj.object_type = ObjectType.DIMENSION
                     else:
@@ -725,6 +784,7 @@ class DataModuleExtractor(BaseExtractor):
                             relationships.append(rel)
             
             # Extract calculations (embedded calculated fields) (dedupe by calc_id)
+            # Skip expressions that are only a simple column reference [M].[T].[C] (e.g. [bq-connection].[Orders].[Quantity]).
             # Always keep object_type as CALCULATED_FIELD; store data_usage in properties for measure/dimension use.
             calculations = moser_json.get("calculation", [])
             if not isinstance(calculations, list):
@@ -737,6 +797,8 @@ class DataModuleExtractor(BaseExtractor):
                 seen_calc_ids.add(calc_id)
                 calc_name = calc.get("label", calc.get("identifier", "Unknown"))
                 expression = calc.get("expression", "")
+                if _expression_is_simple_column_reference(expression):
+                    continue
                 usage = calc.get("usage", "")
                 datatype = calc.get("datatype", "")
                 aggregate = calc.get("regularAggregate", "")
@@ -962,7 +1024,8 @@ class DataModuleExtractor(BaseExtractor):
             
             # Skip dataItems that are calculated fields; they are emitted only by _extract_calculated_fields
             # to avoid double-extraction (same dataItem as both measure/dimension and calculated_field).
-            if _expression_is_calculated_field(expression):
+            # Also skip when name suggests calculated (Cognos: leading underscore, e.g. _days_to_end_of_month).
+            if _expression_is_calculated_field(expression) or _name_looks_like_calculated_field(name):
                 continue
             
             # Parse RS_dataType and RS_dataUsage from XMLAttributes
@@ -989,16 +1052,28 @@ class DataModuleExtractor(BaseExtractor):
                     table_name = match.group(2)
                     source_column = match.group(3)
             
+            # Normalize aggregate: empty string or missing => 'none' (avoid misclassifying dimensions as measures)
+            agg_normalized = (aggregate or "").strip().lower() or "none"
+            
             # Determine object type based on usage
             # RS_dataUsage: 0=attribute, 1=dimension, 2=measure. Treat attribute as dimension for analytics.
+            # When RS_dataUsage is missing, infer dimension for simple [M].[T].[C] columns (e.g. Postal_Code, Segment, Category).
             obj_type = ObjectType.COLUMN
-            if data_usage == 'measure' or aggregate != 'none':
+            if data_usage == "measure" or agg_normalized != "none":
                 obj_type = ObjectType.MEASURE
-            elif data_usage in ('dimension', 'attribute'):
+            elif data_usage in ("dimension", "attribute"):
                 obj_type = ObjectType.DIMENSION
+            elif data_usage is None and agg_normalized == "none" and (
+                _expression_is_simple_column_reference(expression) or _name_looks_like_dimension(name)
+            ):
+                # No usage in XML but simple column reference or well-known dimension name, and no aggregation => dimension
+                obj_type = ObjectType.DIMENSION
+                data_usage = "dimension"
             
             # Create column object
             column_id = f"{parent_id}:dataitem:{name}"
+            # Store normalized aggregate in properties so downstream sees 'none' not ''
+            agg_for_props = AGGREGATION_MAP.get(agg_normalized, agg_normalized) if agg_normalized else "none"
             column_obj = self._create_object(
                 object_id=column_id,
                 name=name,
@@ -1007,7 +1082,8 @@ class DataModuleExtractor(BaseExtractor):
                     "expression": expression,
                     "data_type": data_type,
                     "data_usage": data_usage,
-                    "aggregate": AGGREGATION_MAP.get(aggregate, aggregate),
+                    "aggregate": agg_for_props,
+                    "aggregation": agg_for_props,
                     "rollup_aggregate": rollup_aggregate,
                     "source_table": table_name,
                     "source_column": source_column,
@@ -1026,7 +1102,7 @@ class DataModuleExtractor(BaseExtractor):
             relationships.append(rel)
             
             # If this is a measure with aggregation, create aggregates relationship
-            if obj_type == ObjectType.MEASURE and aggregate != 'none' and source_column:
+            if obj_type == ObjectType.MEASURE and agg_normalized != "none" and source_column:
                 # Try to find the base column this measure aggregates
                 base_col_id = f"{parent_id}:col:{table_name}.{source_column}"
                 agg_rel = self._create_relationship(
@@ -1034,7 +1110,7 @@ class DataModuleExtractor(BaseExtractor):
                     target_id=base_col_id,
                     relationship_type=RelationshipType.AGGREGATES,
                     properties={
-                        "aggregate_type": AGGREGATION_MAP.get(aggregate, aggregate),
+                        "aggregate_type": AGGREGATION_MAP.get(agg_normalized, agg_normalized),
                         "base_column": source_column
                     }
                 )
@@ -1066,15 +1142,12 @@ class DataModuleExtractor(BaseExtractor):
             if not name or name in seen_fields:
                 continue
             
-            # Get expression
+            # Get expression (may be empty for name-based calculated items)
             expr_elem = data_item.find('.//{*}expression')
-            if expr_elem is None or not expr_elem.text:
-                continue
-                
-            expression = expr_elem.text.strip()
-            
-            # Only emit calculated fields (same rule as _extract_data_items skip to avoid duplication)
-            if not _expression_is_calculated_field(expression):
+            expression = (expr_elem.text or "").strip() if expr_elem is not None and expr_elem.text else ""
+
+            # Emit calculated fields: expression matches calculation patterns, or name suggests calculated (e.g. _days_to_end_of_month)
+            if not (_expression_is_calculated_field(expression) or _name_looks_like_calculated_field(name)):
                 continue
             
             seen_fields.add(name)

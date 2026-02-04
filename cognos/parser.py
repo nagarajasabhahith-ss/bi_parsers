@@ -337,6 +337,10 @@ class CognosParser(BaseParser):
                     obj_id = XmlHandler.get_text(obj_elem, "id")
                     obj_name = XmlHandler.get_text(obj_elem, "name", default="<unnamed>")
                     parent_id = XmlHandler.get_text(obj_elem, "parentId")
+                    # storeID at object level (used below and as fallback for missing id)
+                    store_id_from_obj = XmlHandler.get_text(obj_elem, "storeID")
+                    if not obj_id and store_id_from_obj:
+                        obj_id = store_id_from_obj  # Some exports omit <id>; storeID is unique
                     
                     # Map to appropriate object type
                     obj_type = None
@@ -372,13 +376,13 @@ class CognosParser(BaseParser):
                     
                     if obj_type:
                         props = {}
+                        # storeID is a direct child of <object> in dataSource.xml, not inside <props>
+                        store_id = store_id_from_obj
                         props_elem = obj_elem.find("props")
                         if props_elem is not None:
-                            store_id = XmlHandler.get_text(props_elem, "storeID")
-                            if store_id:
-                                props["storeID"] = store_id
-                                data_sources_by_store_id[store_id] = obj_id
-                            
+                            # Fallback: some exports may put storeID inside props
+                            if not store_id:
+                                store_id = XmlHandler.get_text(props_elem, "storeID")
                             # Extract connection properties
                             connection_string = XmlHandler.get_text(props_elem, "connectionString/value")
                             if connection_string:
@@ -424,6 +428,10 @@ class CognosParser(BaseParser):
                             
                             if data_source_type:
                                 props["data_source_type"] = data_source_type
+                        # Store storeID from object level (or from props fallback) for relationships and report
+                        if store_id:
+                            props["storeID"] = store_id
+                            data_sources_by_store_id[store_id] = obj_id
                         
                         props["cognosClass"] = obj_class
                         
